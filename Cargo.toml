@@ -1,0 +1,16 @@
+[package]
+name = "mac_cleaner"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mC"
+path = "src/main.rs"
+
+[[bin]]
+name = "mCp"
+path = "src/mainP.rs"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
