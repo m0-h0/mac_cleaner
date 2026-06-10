@@ -83,6 +83,8 @@ fn term_size() -> (usize, usize) {
 enum Key {
     Up,
     Down,
+    PageUp,
+    PageDown,
     Enter,
     Space,
     Backspace,
@@ -120,6 +122,9 @@ fn read_key() -> Key {
             Some(b'[') => match read_byte_timeout(100) {
                 Some(b'A') => Key::Up,
                 Some(b'B') => Key::Down,
+                // PgUp = \x1b[5~  PgDn = \x1b[6~
+                Some(b'5') => { read_byte_timeout(100); Key::PageUp }
+                Some(b'6') => { read_byte_timeout(100); Key::PageDown }
                 _          => Key::Esc,
             },
             _ => Key::Esc,
@@ -296,7 +301,10 @@ impl App {
         App { root, entries, cursor: 0, selected: HashSet::new(), scroll: 0, input: None }
     }
 
+    // 2 header lines + 1 blank + 1 separator + 1 footer = 5 reserved rows
     fn vis_rows(&self, h: usize) -> usize { h.saturating_sub(5) }
+
+    fn page_size(&self, h: usize) -> usize { self.vis_rows(h).max(1) }
 
     fn ensure_cursor_visible(&mut self, h: usize) {
         let vis = self.vis_rows(h);
@@ -305,6 +313,22 @@ impl App {
         } else if vis > 0 && self.cursor >= self.scroll + vis {
             self.scroll = self.cursor + 1 - vis;
         }
+    }
+
+    fn page_down(&mut self, h: usize) {
+        let pg = self.page_size(h);
+        self.cursor = (self.cursor + pg).min(self.entries.len().saturating_sub(1));
+        self.scroll = (self.scroll + pg).min(
+            self.entries.len().saturating_sub(self.vis_rows(h))
+        );
+        self.ensure_cursor_visible(h);
+    }
+
+    fn page_up(&mut self, h: usize) {
+        let pg = self.page_size(h);
+        self.cursor = self.cursor.saturating_sub(pg);
+        self.scroll = self.scroll.saturating_sub(pg);
+        self.ensure_cursor_visible(h);
     }
 
     fn renumber(&mut self) {
@@ -378,66 +402,92 @@ impl App {
         let mut out = String::with_capacity(8192);
         out.push_str("\x1b[H\x1b[2J");
 
-        // Header
+        // ── Header (2 lines) ─────────────────────────────────────────────────
+        let total_pages = if vis == 0 { 1 } else {
+            (self.entries.len() + vis - 1) / vis
+        };
+        let cur_page = if vis == 0 { 1 } else { self.scroll / vis + 1 };
+        let page_info = if total_pages > 1 {
+            format!("  {}", dim!(format!("page {cur_page}/{total_pages}  ◀▶ or PgUp/PgDn")))
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "{} Largest items under {}\n\n",
-            green!("◉"), bold!(self.root.display())
+            "{} Largest items under {}{}\n\n",
+            green!("◉"), bold!(self.root.display()), page_info
         ));
 
-        // Entry list
+        // ── Entry list (vis rows exactly) ────────────────────────────────────
         let end = (self.scroll + vis).min(self.entries.len());
         for i in self.scroll..end {
             let e = &self.entries[i];
             let is_cursor = i == self.cursor;
             let is_sel    = self.selected.contains(&e.path);
 
-            let sel    = if is_sel { yellow!("✓") } else { " ".to_string() };
-            let num    = if e.num > 0 { format!("{:>3}", e.num) } else { "   ".to_string() };
-            let indent = "  ".repeat(e.depth);
-            let icon   = if e.is_dir { if e.expanded { "📂" } else { "📁" } } else { "📄" };
-            let sz     = format!("{:>10}", human(e.size));
+            let sel_ch  = if is_sel { "✓" } else { " " };
+            let num_str = if e.num > 0 { format!("{:>3}", e.num) } else { "   ".to_string() };
+            let indent  = "  ".repeat(e.depth);
+            let icon    = if e.is_dir { if e.expanded { "📂" } else { "📁" } } else { "📄" };
+            let sz      = format!("{:>10}", human(e.size));
             let raw_name = e.path.file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| e.path.display().to_string());
 
-            let left = 1 + 1 + 3 + 2 + e.depth * 2 + 4 + 2 + sz.len() + 2;
-            let max_name = w.saturating_sub(left).max(8);
+            // Visible column count (no ANSI codes in these parts yet)
+            // sel(1) space(1) num(3) 2sp indent icon(2wide) 2sp sz 2sp name
+            let icon_vis = 2; // emoji renders as 2 cols
+            let fixed_vis = 1 + 1 + 3 + 2 + e.depth * 2 + icon_vis + 2 + sz.len() + 2;
+            let max_name = w.saturating_sub(fixed_vis).max(4);
             let name = if raw_name.chars().count() > max_name {
                 format!("{}…", raw_name.chars().take(max_name - 1).collect::<String>())
             } else {
-                raw_name
+                format!("{:<max_name$}", raw_name)
             };
 
-            let line   = format!("{sel} {num}  {indent}{icon}  {sz}  {name}");
-            let padded = format!("{:<width$}", line, width = w.min(300));
-            out.push_str(&format!("{}\n", if is_cursor { rev!(padded) } else { padded }));
+            // Build plain line then apply highlight to the whole row
+            let plain = format!("{sel_ch} {num_str}  {indent}{icon}  {sz}  {name}");
+            if is_cursor {
+                let colored = if is_sel { yellow!(sel_ch) } else { sel_ch.to_string() };
+                let highlighted = format!(
+                    "{}{REVERSE}{} {num_str}  {indent}{icon}  {sz}  {name}{RESET}",
+                    colored, " "
+                );
+                out.push_str(&highlighted);
+            } else if is_sel {
+                // Skip the sel_ch prefix cleanly using char-aware split
+                let rest = plain.chars().skip(1).collect::<String>();
+                out.push_str(&format!("{}{}", yellow!(sel_ch), rest));
+            } else {
+                out.push_str(&plain);
+            }
+            out.push('\n');
         }
 
+        // Fill remaining rows so footer stays at the bottom
         for _ in end..self.scroll + vis {
             out.push('\n');
         }
 
-        // Footer
-        out.push_str(&format!("{}\n", dim!("─".repeat(w.min(100)))));
+        // ── Footer (separator + 1 line) ──────────────────────────────────────
+        out.push_str(&format!("{}\n", dim!("─".repeat(w.min(200)))));
         if let Some(ref buf) = self.input {
             out.push_str(&format!(
-                "  {} {}█  {}\n",
+                "  {} {}█  {}",
                 bold!("Select:"), yellow!(buf),
                 dim!("comma-separated numbers · Enter=confirm · Esc=cancel")
             ));
         } else {
             let sel_info = if !self.selected.is_empty() {
-                format!("{}  ", yellow!(format!("{} ✓ selected", self.selected.len())))
+                format!("{}  ", yellow!(format!("{} ✓", self.selected.len())))
             } else {
                 String::new()
             };
             out.push_str(&format!(
-                "  {}{}  {}  {}  {}  {}  {}\n",
+                "  {}{}  {}  {}  {}  {}",
                 sel_info,
                 dim!("↑↓ move"),
                 dim!("Space expand"),
-                dim!("s select cursor"),
-                dim!("1,2,… multi-select"),
+                dim!("s select  1,2,… multi"),
                 dim!("Enter action"),
                 dim!("q quit"),
             ));
@@ -483,10 +533,10 @@ fn show_action(app: &mut App, w: usize, h: usize) -> bool {
             }
             Key::Char('d') | Key::Char('D') => {
                 print!("\x1b[{}H\x1b[2K", h.saturating_sub(1));
-                print!("  {} Type {} to confirm: ", yellow!("⚠"), bold!("DELETE"));
+                print!("  {} Type {} to confirm: ", yellow!("⚠"), bold!("DEL"));
                 io::stdout().flush().unwrap();
                 let confirm = collect_chars();
-                if confirm == "DELETE" {
+                if confirm == "DEL" {
                     let paths: Vec<PathBuf> = targets.iter().map(|(p, _)| p.clone()).collect();
                     let mut errs: Vec<String> = vec![];
                     for p in &paths {
@@ -564,6 +614,8 @@ fn main() {
             Key::Down => {
                 if app.cursor + 1 < app.entries.len() { app.cursor += 1; }
             }
+            Key::PageUp | Key::Char('<') => app.page_up(h),
+            Key::PageDown | Key::Char('>') => app.page_down(h),
             Key::Space => {
                 let i = app.cursor;
                 if app.entries[i].is_dir && !app.entries[i].expanded {
